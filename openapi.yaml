@@ -1,0 +1,369 @@
+openapi: 3.0.3
+info:
+  title: Expense Tracker API
+  version: 1.0.0
+  description: |
+    Expense tracking for small teams. Users record expenses, read back their own,
+    and administrators review everything.
+
+    This spec documents the hardened build (`hardened/app.py`). It is written
+    against the code as it actually behaves, including every error path the test
+    suite asserts on.
+
+    ## Authentication
+
+    Call `POST /login` to exchange a username and password for a bearer token,
+    then send it as `Authorization: Bearer <token>` on every other endpoint.
+    Tokens are 256 bits of CSPRNG output and expire one hour after they are
+    issued. An expired token is rejected the same way an invalid one is, with
+    401. There is no refresh endpoint: log in again.
+
+    ## Errors
+
+    Every error is a JSON object with a single `error` key. Error messages are
+    deliberately vague where a precise one would leak information. `POST /login`
+    returns the same 401 for an unknown username and a wrong password, and
+    `GET /expenses/{expense_id}` returns 404 rather than 403 for an expense
+    belonging to another user, so neither endpoint confirms that an account or a
+    record exists.
+
+    ## Rate limiting
+
+    `POST /login` allows five failed attempts per username in a fifteen minute
+    window, then returns 429 until the window passes. A successful login clears
+    the counter. Other endpoints are not rate limited.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:5000
+    description: Local development
+
+tags:
+  - name: Authentication
+    description: Registration and session management.
+  - name: Expenses
+    description: Creating and reading expenses. All routes are scoped to the caller.
+  - name: Admin
+    description: Endpoints restricted to administrator accounts.
+  - name: Utility
+
+paths:
+  /register:
+    post:
+      tags: [Authentication]
+      summary: Create an account
+      description: |
+        Creates a user. Usernames are unique and case sensitive. New accounts are
+        never administrators; that flag is set out of band.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '201':
+          description: Account created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, username]
+                properties:
+                  id:
+                    type: integer
+                    example: 1
+                  username:
+                    type: string
+                    example: alice
+        '400':
+          description: Username or password missing or empty.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: username and password required }
+        '409':
+          description: That username is already taken.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: username taken }
+
+  /login:
+    post:
+      tags: [Authentication]
+      summary: Exchange credentials for a bearer token
+      description: |
+        Returns a token valid for one hour.
+
+        Sessions are concurrent. Logging in again issues an additional token and
+        does not end earlier sessions, so a user signed in on two devices stays
+        signed in on both. Each token expires one hour after it was issued. There
+        is no logout endpoint, so a token cannot be revoked before it expires.
+
+        An unknown username and a wrong password both return 401 with an
+        identical body. This is deliberate and stops the endpoint being used to
+        discover which accounts exist.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+                    description: Bearer token. Treat as a secret and never log it.
+                    example: xQ8_kR2mVn4pLs7TgYw1ZbAe6HdJc0FiUoNqMrXyKvE
+        '401':
+          description: Invalid credentials. Returned for both an unknown user and a wrong password.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: invalid credentials }
+        '429':
+          description: Too many failed attempts for this username. Try again later.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: too many attempts, try again later }
+
+  /expenses:
+    get:
+      tags: [Expenses]
+      summary: List your expenses
+      description: Returns every expense belonging to the authenticated caller.
+      responses:
+        '200':
+          description: The caller's expenses, empty if they have none.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Expenses]
+      summary: Record an expense
+      description: |
+        Only `description` and `amount_cents` are read from the body. Any other
+        field is ignored. The owner is taken from the bearer token and new
+        expenses always start unapproved, so neither can be set by the client.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpenseCreate'
+      responses:
+        '201':
+          description: Expense created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: { type: integer, example: 7 }
+        '400':
+          description: |
+            `description` is missing, empty or not a string, or `amount_cents`
+            is not an integer. Booleans and numeric strings are rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: amount_cents must be an integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /expenses/search:
+    get:
+      tags: [Expenses]
+      summary: Search your expenses by description
+      description: |
+        Case insensitive substring match across the caller's own expenses only.
+
+        The search term is matched literally. `%` and `_` are escaped rather than
+        treated as wildcards, so searching for `50%` finds "50% deposit" and
+        searching for `%` alone matches nothing rather than everything.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Substring to look for. Omitted or empty matches all of the caller's expenses.
+          schema:
+            type: string
+            example: lunch
+      responses:
+        '200':
+          description: Matching expenses owned by the caller.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /expenses/{expense_id}:
+    get:
+      tags: [Expenses]
+      summary: Fetch one of your expenses
+      description: |
+        Returns 404 both when the expense does not exist and when it belongs to
+        another user. The endpoint will not confirm that an id exists to someone
+        who cannot read it.
+      parameters:
+        - name: expense_id
+          in: path
+          required: true
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: The expense.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No such expense, or it belongs to someone else.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: not found }
+
+  /admin/report:
+    get:
+      tags: [Admin]
+      summary: Every expense across all users
+      description: Administrators only. Normal accounts receive 403.
+      responses:
+        '200':
+          description: All expenses.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Expense' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Authenticated, but not an administrator.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: forbidden }
+
+  /rates:
+    get:
+      tags: [Utility]
+      summary: Currency conversion helper
+      description: Divides 100 by the supplied divisor. Present mainly to exercise input validation and the error handler.
+      security: []
+      parameters:
+        - name: divisor
+          in: query
+          required: false
+          schema: { type: integer, default: 1, example: 4 }
+      responses:
+        '200':
+          description: The computed rate.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rate]
+                properties:
+                  rate: { type: number, example: 25 }
+        '400':
+          description: The divisor was zero or not an integer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: divisor must not be zero }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Token from `POST /login`. Expires one hour after it is issued.
+
+  responses:
+    Unauthorized:
+      description: The bearer token is missing, malformed, unknown or expired.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: unauthorized }
+
+  schemas:
+    Credentials:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          example: alice
+        password:
+          type: string
+          format: password
+          minLength: 1
+          example: correct-horse-battery-staple
+
+    Expense:
+      type: object
+      required: [id, user_id, description, amount_cents, is_approved]
+      properties:
+        id:
+          type: integer
+          example: 7
+        user_id:
+          type: integer
+          description: Owner of the expense. Set from the session, never from the request body.
+          example: 1
+        description:
+          type: string
+          example: team lunch
+        amount_cents:
+          type: integer
+          description: Amount in minor units, to avoid floating point rounding on money.
+          example: 4200
+        is_approved:
+          type: integer
+          enum: [0, 1]
+          description: Approval flag. Always 0 on creation and only changed out of band.
+          example: 0
+
+    ExpenseCreate:
+      type: object
+      required: [description, amount_cents]
+      properties:
+        description:
+          type: string
+          minLength: 1
+          example: team lunch
+        amount_cents:
+          type: integer
+          example: 4200
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: unauthorized
+
+security:
+  - bearerAuth: []
