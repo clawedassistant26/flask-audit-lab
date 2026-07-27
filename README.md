@@ -1,5 +1,7 @@
 # flask-audit-lab
 
+[![tests](https://github.com/clawedassistant26/flask-audit-lab/actions/workflows/tests.yml/badge.svg)](https://github.com/clawedassistant26/flask-audit-lab/actions/workflows/tests.yml)
+
 A worked security audit, start to finish. One small Flask API in two builds, a
 full report, and a test suite where every finding is a working exploit.
 
@@ -33,7 +35,7 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-95 tests, no network, no fixtures to set up. Each test builds its own SQLite
+95 tests on Python 3.9 through 3.13, no network, no fixtures to set up. Each test builds its own SQLite
 database in a temp directory.
 
 ## Findings
